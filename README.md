@@ -196,7 +196,7 @@ Same DKSAP layout as [EIP-5564](https://eips.ethereum.org/EIPS/eip-5564) / [ERC-
 
 ## Contributors
 
-Parts of this codebase were written by contributors at the project’s previous home, [**collinsadi/opauque-stellar**](https://github.com/collinsadi/opauque-stellar) (note the spelling: *opauque*, not *opaque*). Development continues in **this** repository because that name cannot be corrected on GitHub right now, and the project needed a cleaner, stricter baseline for open-source work—supply-chain checks, CI gates, security policy, and related hygiene.
+Parts of this codebase were written by contributors at the project’s previous home, [**collinsadi/opauque-stellar**](https://github.com/collinsadi/opauque-stellar) (note the spelling: *opauque*, not *opaque*). Much of that work happened during the **Stellar wave** on [Drips](https://drips.network/wave). Development continues in **this** repository because that name cannot be corrected on GitHub right now, and the project needed a cleaner, stricter baseline for open-source work—supply-chain checks, CI gates, security policy, and related hygiene.
 
 Avatars below are generated automatically from Git commit history on the previous repository ([contrib.rocks](https://contrib.rocks) → GitHub Contributors API). New contributions in **this** repo will appear on its own graph once people land commits here.
 
