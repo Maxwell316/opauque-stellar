@@ -315,6 +315,21 @@ export function ProofGeneratorModal({ trait, onClose }: ProofGeneratorModalProps
 
           {step === "setup" && (
             <>
+              {/* WASM loading state — shown while cryptography module initialises */}
+              {!wasmReady && (
+                <div
+                  className="flex items-center gap-3 rounded-xl border border-ink-700 bg-ink-950/50 px-4 py-3"
+                  aria-live="polite"
+                  aria-label="Loading cryptography module"
+                >
+                  <span
+                    className="h-4 w-4 shrink-0 animate-spin rounded-full border border-ink-600 border-t-white"
+                    aria-hidden
+                  />
+                  <span className="text-xs text-mist">Loading cryptography module…</span>
+                </div>
+              )}
+
               <div className="space-y-2">
                 <label className="block text-sm font-medium text-white">
                   External Nullifier
@@ -339,10 +354,10 @@ export function ProofGeneratorModal({ trait, onClose }: ProofGeneratorModalProps
               <button
                 type="button"
                 onClick={handleGenerate}
-                disabled={!externalNullifier.trim()}
+                disabled={!externalNullifier.trim() || !wasmReady}
                 className="w-full rounded-xl bg-white text-black border border-white py-3 text-sm font-semibold hover:bg-black hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
-                Generate Proof in Browser
+                {!wasmReady ? "Loading cryptography module…" : "Generate Proof in Browser"}
               </button>
 
               <p className="text-center text-xs text-ink-500">

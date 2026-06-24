@@ -19,9 +19,18 @@ import { BrandingPage } from "./components/BrandingPage.tsx";
 import { StellarWalletProviders } from "./context/StellarWalletProviders.tsx";
 import { MainnetSecurityLayer } from "./components/security/MainnetSecurityLayer.tsx";
 import { logExpectedArtifactHashes } from "./lib/artifactHashes.ts";
+import { OperatorDashboard } from "./components/OperatorDashboard.tsx";
+import { ProtocolLogProvider } from "./context/ProtocolLogContext.tsx";
 
 console.log("[Opaque] App bootstrapping (Stellar)…");
 logExpectedArtifactHashes();
+
+// Register service worker for static asset caching
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {
+    // SW registration failure is non-fatal; app functions normally without it.
+  });
+}
 
 const network = getConfiguredNetwork();
 if (!isClusterSupported(network)) {
@@ -50,6 +59,7 @@ createRoot(document.getElementById("root")!).render(
           <Route path="/pay/success" element={<PaySuccessPage />} />
           <Route path="/pay/:identifier" element={<KeysProvider><PayPage /></KeysProvider>} />
           <Route path="/branding" element={<BrandingPage />} />
+          <Route path="/operator" element={<ProtocolLogProvider><OperatorDashboard /></ProtocolLogProvider>} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </BrowserRouter>

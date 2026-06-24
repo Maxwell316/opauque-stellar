@@ -25,6 +25,9 @@ export default defineConfig({
           state: ['zustand', 'idb'],
           animation: ['framer-motion'],
           prover: ['snarkjs', 'circomlibjs'],
+          // Note: the WASM cryptography module (/pkg/cryptography.js) is loaded lazily
+          // via a dynamic import inside useOpaqueWasm (useEffect) — it is excluded from
+          // optimizeDeps below so Vite never pre-bundles it into the initial chunk.
         },
       },
     },

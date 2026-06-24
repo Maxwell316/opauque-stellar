@@ -268,11 +268,52 @@ function ToastLayer() {
   );
 }
 
+/**
+ * SwUpdateBanner — listens for { type: 'SW_UPDATED' } from the service worker
+ * and shows a reload prompt so users pick up the latest assets.
+ */
+function SwUpdateBanner() {
+  const [show, setShow] = useState(false);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+
+    const handler = (event: MessageEvent) => {
+      if (event.data?.type === "SW_UPDATED") {
+        setShow(true);
+      }
+    };
+
+    navigator.serviceWorker.addEventListener("message", handler);
+    return () => navigator.serviceWorker.removeEventListener("message", handler);
+  }, []);
+
+  if (!show) return null;
+
+  return (
+    <div
+      className="fixed top-0 inset-x-0 z-[9999] flex items-center justify-between gap-3 bg-ink-900 border-b border-ink-700 px-4 py-2.5"
+      role="status"
+      aria-live="polite"
+    >
+      <span className="text-xs text-white">Update available</span>
+      <button
+        type="button"
+        onClick={() => window.location.reload()}
+        className="text-xs font-medium text-white underline decoration-white/50 underline-offset-2 hover:decoration-white transition-colors shrink-0"
+      >
+        Reload to update
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
   return (
     <KeysProvider>
       <ProtocolLogProvider>
         <ToastProvider>
+          <SwUpdateBanner />
           <NetworkMismatchModal />
           <AppContent />
           <ToastLayer />

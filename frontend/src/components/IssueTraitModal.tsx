@@ -8,7 +8,7 @@
 
 import { useState, useCallback } from "react";
 import { useWallet } from "../hooks/useWallet";
-import { getCluster } from "../lib/chain";
+import { getCluster, getRpcUrl, getNetworkPassphrase } from "../lib/chain";
 import { getExplorerTxUrl } from "../lib/explorer";
 import { computeStealthAddressAndViewTag } from "../lib/stealth";
 import { announceStealthTransfer, SCHEME_ID_SECP256K1 } from "../lib/contracts";
@@ -16,6 +16,7 @@ import { getConfigForCluster } from "../contracts/contract-config";
 import { KNOWN_TRAITS } from "../lib/reputation";
 import { ModalShell } from "./ModalShell";
 import { useTxHistoryStore } from "../store/txHistoryStore";
+import { ContractCostEstimator } from "./ContractCostEstimator";
 
 type IssueTraitModalProps = {
   onClose: () => void;
@@ -243,6 +244,24 @@ export function IssueTraitModal({ onClose }: IssueTraitModalProps) {
               </div>
             </div>
           )}
+
+          {/* Gas cost estimator — shown for attest/verify when a valid contract is configured */}
+          {canSubmit && (() => {
+            const config = getConfigForCluster(cluster);
+            const contractId = config?.attestationEngineContract ?? "";
+            // Estimate for attest method (the primary operation in issue-trait flow)
+            return contractId ? (
+              <div className="mb-4">
+                <ContractCostEstimator
+                  contractId={contractId}
+                  method="attest"
+                  args={[]}
+                  rpcUrl={getRpcUrl()}
+                  network={getNetworkPassphrase()}
+                />
+              </div>
+            ) : null;
+          })()}
 
           <div className="flex gap-3">
             <button
