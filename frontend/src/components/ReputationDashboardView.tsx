@@ -5,7 +5,7 @@
  * Traits are discovered by the Rust WASM scanner from announcement metadata.
  * When the user clicks "Prove Trait," a modal explains what will be shared
  * (the trait) vs what stays hidden (wallet, history). The WASM core then
- * generates a witness, and snarkjs creates the Groth16 proof in a background worker.
+ * generates a witness, and snarkjs creates the Groth16 proof in a Web Worker.
  */
 
 import { useState, useCallback, useEffect } from "react";

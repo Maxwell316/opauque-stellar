@@ -6,7 +6,7 @@
  * triggers witness generation via WASM and proof generation via snarkjs.
  */
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { useWallet } from "../hooks/useWallet";
 const toHex = (n: bigint | number, opts?: { size?: number }) => {
   const hex = BigInt(n).toString(16);
@@ -17,7 +17,12 @@ import { useReputationStore } from "../store/reputationStore";
 import { useOpaqueWasm } from "../hooks/useOpaqueWasm";
 import { useKeys } from "../context/KeysContext";
 import { getExplorerTxUrl } from "../lib/explorer";
-import { fetchLatestValidMerkleRoot, generateReputationProof, submitProofOnChain } from "../lib/reputationProver";
+import {
+  fetchLatestValidMerkleRoot,
+  generateReputationProof,
+  ProofGenerationCancelledError,
+  submitProofOnChain,
+} from "../lib/reputationProver";
 import type { DiscoveredTrait, ProofData } from "../lib/reputation";
 import { ModalShell } from "./ModalShell";
 
@@ -36,6 +41,14 @@ export function ProveTraitModal({ trait, onClose }: ProveTraitModalProps) {
     useReputationStore();
   const { wasm } = useOpaqueWasm();
   const { getMasterKeys, isSetup } = useKeys();
+  const proofAbortRef = useRef<AbortController | null>(null);
+
+  const handleCancelGenerate = useCallback(() => {
+    proofAbortRef.current?.abort();
+    proofAbortRef.current = null;
+    resetProof();
+    setStep("explain");
+  }, [resetProof]);
 
   const handleGenerate = useCallback(async () => {
     if (!wasm) {
@@ -51,6 +64,8 @@ export function ProveTraitModal({ trait, onClose }: ProveTraitModalProps) {
 
     setStep("generating");
     startProof(trait.traitDef.id);
+    const abortController = new AbortController();
+    proofAbortRef.current = abortController;
 
     try {
       const masterKeys = getMasterKeys();
@@ -79,7 +94,8 @@ export function ProveTraitModal({ trait, onClose }: ProveTraitModalProps) {
         JSON.stringify(attestationsForWasm),
         stealthPrivKey,
         externalNullifier,
-        (stage, percent) => setProofStage(stage as "preparing-witness" | "generating-proof", percent),
+        (stage, percent) => setProofStage(stage, percent),
+        abortController.signal,
       );
 
       // Root in snarkjs public signals is often decimal; convert to bytes32 hex for on-chain updates.
@@ -102,9 +118,14 @@ export function ProveTraitModal({ trait, onClose }: ProveTraitModalProps) {
       setProofReady(proofData);
       setStep("ready");
     } catch (err) {
+      if (err instanceof ProofGenerationCancelledError) {
+        return;
+      }
       const msg = err instanceof Error ? err.message : "Unknown error during proof generation";
       setProofError(msg);
       setStep("error");
+    } finally {
+      proofAbortRef.current = null;
     }
   }, [wasm, isSetup, trait, getMasterKeys, startProof, setProofStage, setProofError, setProofReady]);
 
@@ -189,7 +210,11 @@ export function ProveTraitModal({ trait, onClose }: ProveTraitModalProps) {
         <ExplainStep trait={trait} onConfirm={handleGenerate} onCancel={handleClose} />
       )}
       {step === "generating" && (
-        <GeneratingStep progress={proofState.progress} stage={proofState.stage} />
+        <GeneratingStep
+          progress={proofState.progress}
+          stage={proofState.stage}
+          onCancel={handleCancelGenerate}
+        />
       )}
       {step === "ready" && (
         <ReadyStep
@@ -286,7 +311,15 @@ function ExplainStep({
   );
 }
 
-function GeneratingStep({ progress, stage }: { progress: number; stage: string }) {
+function GeneratingStep({
+  progress,
+  stage,
+  onCancel,
+}: {
+  progress: number;
+  stage: string;
+  onCancel: () => void;
+}) {
   const label = stage === "preparing-witness"
     ? "Preparing witness from stealth history..."
     : "Generating ZK-SNARK proof (Groth16)...";
@@ -296,7 +329,7 @@ function GeneratingStep({ progress, stage }: { progress: number; stage: string }
       <div className="w-12 h-12 mx-auto mb-4 border-2 border-ink-600 border-t-white rounded-full animate-spin" aria-hidden />
       <p className="text-sm font-medium text-white mb-1">{label}</p>
       <p className="text-[11px] text-mist mb-4">
-        This runs entirely in your browser using WebAssembly.
+        Proof generation runs in a background worker so the UI stays responsive.
       </p>
       <div className="h-1.5 bg-ink-800 rounded-full overflow-hidden max-w-xs mx-auto">
         <div
@@ -305,6 +338,13 @@ function GeneratingStep({ progress, stage }: { progress: number; stage: string }
         />
       </div>
       <p className="text-[10px] text-mist/70 mt-2">{progress}%</p>
+      <button
+        type="button"
+        onClick={onCancel}
+        className="mt-4 px-4 py-2 rounded-xl text-sm font-medium text-mist border border-ink-600 bg-ink-950/30 hover:border-white/30 hover:text-white transition-colors"
+      >
+        Cancel
+      </button>
     </div>
   );
 }

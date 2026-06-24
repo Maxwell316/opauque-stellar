@@ -1,6 +1,6 @@
 /**
- * Reputation prover — orchestrates witness generation (WASM) and
- * ZK proof generation (snarkjs) for stealth attestations.
+ * Reputation prover — orchestrates witness generation and ZK proof generation
+ * for stealth attestations via a dedicated Web Worker.
  *
  * Also provides the on-chain submit helper that calls the
  * ReputationVerifier Soroban contract.
@@ -13,86 +13,20 @@ import { BASE_FEE, Contract, TransactionBuilder, nativeToScVal } from "@stellar/
 import { bytesToScVal, getSorobanServer, invokeContractMethod, u64ToScVal } from "./stellar";
 import type { SignTxFn } from "./stellar";
 import { getNetworkPassphrase } from "./chain";
-// @ts-expect-error snarkjs has no bundled types
-import * as snarkjs from "snarkjs";
+import {
+  generateV1ProofInWorker,
+  ProofGenerationCancelledError,
+  type ProofProgressCallback,
+} from "./proofWorker/proofWorkerClient";
 
-const CIRCUIT_WASM_PATH = "/circuits/stealth_attestation_js/stealth_attestation.wasm";
-const ZKEY_PATH = "/circuits/sa_final.zkey";
-const TREE_DEPTH = 20;
+export type { ProofProgressCallback };
+export { ProofGenerationCancelledError };
 
 const REPUTATION_CONTRACT_ID = reputationAddresses.reputationVerifier;
 
-export type ProofProgressCallback = (stage: string, percent: number) => void;
-
-function bytesToBigInt(bytes: Uint8Array): bigint {
-  let result = 0n;
-  for (const b of bytes) result = (result << 8n) + BigInt(b);
-  return result;
-}
-
-async function buildCircuitConsistentWitness(
-  traitAttestationId: number,
-  stealthPrivKeyBytes: Uint8Array,
-  externalNullifier: string,
-) {
-  if (typeof globalThis !== "undefined" && !("Buffer" in globalThis)) {
-    const bufferPkg = await import("buffer/index.js");
-    (globalThis as { Buffer?: typeof bufferPkg.Buffer }).Buffer = bufferPkg.Buffer;
-  }
-  const circomlib = await import("circomlibjs");
-  const poseidon = await circomlib.buildPoseidon();
-  const babyjub = await circomlib.buildBabyjub();
-  const F = poseidon.F;
-
-  const attestationId = BigInt(traitAttestationId);
-  const extNullifier = BigInt(externalNullifier);
-
-  const stealthPriv = F.toObject(F.e(bytesToBigInt(stealthPrivKeyBytes)));
-  const ephemeralPriv = F.toObject(F.e(stealthPriv + extNullifier + 1n));
-  const stealthPub = babyjub.mulPointEscalar(babyjub.Base8, stealthPriv);
-  const ephemeralPub = babyjub.mulPointEscalar(babyjub.Base8, ephemeralPriv);
-  const sharedSecret = babyjub.mulPointEscalar(ephemeralPub, stealthPriv);
-
-  const stealthPubX = F.toObject(stealthPub[0]);
-  const stealthPubY = F.toObject(stealthPub[1]);
-  const ephemeralPubX = F.toObject(ephemeralPub[0]);
-  const ephemeralPubY = F.toObject(ephemeralPub[1]);
-  const sharedX = F.toObject(sharedSecret[0]);
-  const sharedY = F.toObject(sharedSecret[1]);
-
-  const addressCommitment = F.toObject(poseidon([sharedX, sharedY, stealthPubX, stealthPubY]));
-  const leaf = F.toObject(poseidon([addressCommitment, attestationId]));
-
-  const zeroHashes: bigint[] = [];
-  zeroHashes.push(F.toObject(poseidon([0n, 0n])));
-  for (let i = 1; i < TREE_DEPTH; i++) {
-    zeroHashes.push(F.toObject(poseidon([zeroHashes[i - 1], zeroHashes[i - 1]])));
-  }
-
-  const merklePathElements: string[] = [];
-  const merklePathIndices: number[] = [];
-  let current = leaf;
-  for (let i = 0; i < TREE_DEPTH; i++) {
-    merklePathElements.push(zeroHashes[i].toString());
-    merklePathIndices.push(0);
-    current = F.toObject(poseidon([current, zeroHashes[i]]));
-  }
-
-  return {
-    merkle_root: current.toString(),
-    attestation_id: attestationId.toString(),
-    external_nullifier: extNullifier.toString(),
-    stealth_private_key: stealthPriv.toString(),
-    ephemeral_pubkey: [ephemeralPubX.toString(), ephemeralPubY.toString()],
-    announcement_attestation_id: attestationId.toString(),
-    merkle_path_elements: merklePathElements,
-    merkle_path_indices: merklePathIndices,
-  };
-}
-
 /**
- * Full proof generation pipeline:
- * 1. Generate witness via WASM
+ * Full proof generation pipeline (runs in a Web Worker):
+ * 1. Build witness inputs with circomlibjs Poseidon/BabyJub
  * 2. Generate Groth16 proof via snarkjs
  */
 export async function generateReputationProof(
@@ -102,25 +36,16 @@ export async function generateReputationProof(
   stealthPrivKeyBytes: Uint8Array,
   externalNullifier: string,
   onProgress: ProofProgressCallback,
+  signal?: AbortSignal,
 ): Promise<ProofData> {
-  onProgress("preparing-witness", 10);
-
-  const witness = await buildCircuitConsistentWitness(
-    trait.attestationId,
-    stealthPrivKeyBytes,
-    externalNullifier
+  const { proof, publicSignals } = await generateV1ProofInWorker(
+    {
+      traitAttestationId: trait.attestationId,
+      stealthPrivKeyBytes: Array.from(stealthPrivKeyBytes),
+      externalNullifier,
+    },
+    { onProgress, signal },
   );
-
-  onProgress("preparing-witness", 70);
-  onProgress("generating-proof", 75);
-
-  const { proof, publicSignals } = await snarkjs.groth16.fullProve(
-    witness,
-    CIRCUIT_WASM_PATH,
-    ZKEY_PATH,
-  );
-
-  onProgress("generating-proof", 95);
 
   // V1 public signal order (canonical — see docs/PUBLIC_SIGNALS.md):
   //   [0] nullifier  [1] is_valid  [2] merkle_root  [3] attestation_id
@@ -134,7 +59,6 @@ export async function generateReputationProof(
     console.error("❌ [Opaque] Generated proof has is_valid=0.", {
       traitId: trait.attestationId,
       publicSignals,
-      witness,
     });
     throw new Error(
       "Generated proof is invalid (is_valid=0). Rescan traits and regenerate."

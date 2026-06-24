@@ -6,7 +6,7 @@
  * to the groth16_verifier program's verify_proof_v2 instruction.
  */
 
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import type { V2DiscoveredTrait } from "../store/schemaStore";
 import { useWallet } from "../hooks/useWallet";
 import { invokeVerifyProofV2, hexToBytes, hexPubkeyToBase58 } from "../lib/programs";
@@ -17,20 +17,11 @@ import { getCluster } from "../lib/chain";
 import { fetchLatestValidMerkleRoot } from "../lib/reputationProver";
 import { getExplorerTxUrl } from "../lib/explorer";
 import { getDemoVerifierUrl } from "../lib/featureFlags";
-
-// @ts-expect-error snarkjs has no bundled types
-import * as snarkjs from "snarkjs";
-
-
-import { buildPoseidon } from "circomlibjs";
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-const V2_CIRCUIT_WASM_PATH = "/circuits/v2/stealth_reputation.wasm";
-const V2_ZKEY_PATH = "/circuits/v2/stealth_reputation_final.zkey";
-const MERKLE_DEPTH = 20;
+import {
+  generateV2ProofInWorker,
+  ProofGenerationCancelledError,
+  type ProofWorkerStage,
+} from "../lib/proofWorker/proofWorkerClient";
 
 // =============================================================================
 // Types
@@ -68,106 +59,6 @@ function stringToBigInt(s: string): bigint {
   return BigInt(s);
 }
 
-/** Convert 32 raw bytes (big-endian) to a BigInt field element. */
-function bytesToFieldBigInt(bytes: Uint8Array): bigint {
-  let val = 0n;
-  for (const b of bytes) {
-    val = (val << 8n) | BigInt(b);
-  }
-  return val;
-}
-
-/**
- * Build all 49 circuit inputs for the StealthReputation(20) circuit.
- *
- * Circuit private inputs:  stealth_pk, schema_id, issuer_pk_x, trait_data_hash,
- *                          nonce, merkle_path[20], merkle_path_indices[20]
- * Circuit public inputs:   merkle_root, attestation_id, external_nullifier, nullifier_hash
- *
- * Strategy:
- *  - stealth_pk: reconstructed from master spend/view keys + ephemeral pubkey (via WASM)
- *  - Merkle tree: single-leaf Poseidon tree at depth 20 (leaf = the user's attestation)
- *  - trait_data_hash: 0n (data_hex is not decoded in this release; proof is still sound)
- *  - nullifier_hash: Poseidon2(stealth_pk, external_nullifier) in JS
- */
-async function buildCircuitInputs(
-  trait: V2DiscoveredTrait,
-  externalNullifierStr: string,
-  wasm: {
-    reconstruct_signing_key_wasm: (a: Uint8Array, b: Uint8Array, c: Uint8Array) => Uint8Array;
-  },
-  masterKeys: { viewPrivKey: Uint8Array; spendPrivKey: Uint8Array },
-  ephemeralPubKeyBytes: Uint8Array
-): Promise<Record<string, unknown>> {
-  // ── 1. Reconstruct the stealth secp256k1 private key ─────────────────────
-  const stealthPrivKeyBytes = wasm.reconstruct_signing_key_wasm(
-    masterKeys.spendPrivKey,
-    masterKeys.viewPrivKey,
-    ephemeralPubKeyBytes
-  );
-  const stealthPk = bytesToFieldBigInt(stealthPrivKeyBytes);
-
-  // ── 2. Parse preimage field elements ─────────────────────────────────────
-  // WASM scanner stores these as 0x-prefixed 64-char hex strings.
-  const schemaId = stringToBigInt(trait.merkleLeafPreimage.schemaIdField);
-  const issuerPkX = stringToBigInt(trait.merkleLeafPreimage.issuerPkX);
-  const nonce = stringToBigInt(trait.merkleLeafPreimage.nonceField);
-  // trait_data_hash is a placeholder (0) until data decoding is implemented.
-  const traitDataHash = 0n;
-
-  // ── 3. Parse external nullifier (decimal or 0x-hex) ──────────────────────
-  const externalNullifier = stringToBigInt(externalNullifierStr.trim());
-
-  // ── 4. Build Poseidon (circomlib-compatible) ──────────────────────────────
-  // NOTE: circomlibjs poseidon returns a Uint8Array (field element), NOT a
-  // bigint. Always convert with poseidon.F.toObject() before arithmetic.
-  const poseidon = await buildPoseidon();
-  const F = poseidon.F;
-  /** Wrap poseidon call so callers always get a proper bigint back. */
-  const ph = (inputs: bigint[]): bigint => F.toObject(poseidon(inputs)) as bigint;
-
-  // ── 5. Compute the leaf: Poseidon5(stealth_pk, schema_id, issuer_pk_x, trait_data_hash, nonce)
-  const leaf: bigint = ph([stealthPk, schemaId, issuerPkX, traitDataHash, nonce]);
-
-  // ── 6. Build a depth-20 single-leaf Poseidon Merkle tree ─────────────────
-  // zero_hashes[i] = hash of an empty subtree at level i.
-  const zeroHashes: bigint[] = [0n];
-  for (let i = 0; i < MERKLE_DEPTH; i++) {
-    zeroHashes.push(ph([zeroHashes[i], zeroHashes[i]]));
-  }
-
-  // The single leaf is at index 0 (always a left child at every level).
-  const merklePath: bigint[] = [];
-  const merklePathIndices: number[] = [];
-  let current: bigint = leaf;
-  for (let i = 0; i < MERKLE_DEPTH; i++) {
-    merklePath.push(zeroHashes[i]);   // sibling = empty subtree at this level
-    merklePathIndices.push(0);        // 0 = current node is the left child
-    current = ph([current, zeroHashes[i]]);
-  }
-  const merkleRoot: bigint = current;
-
-  // ── 7. Compute nullifier_hash = Poseidon2(stealth_pk, external_nullifier) ─
-  const nullifierHash: bigint = ph([stealthPk, externalNullifier]);
-
-  // ── 8. Assemble all 49 circuit signals ───────────────────────────────────
-  return {
-    // Private
-    stealth_pk: stealthPk.toString(),
-    schema_id: schemaId.toString(),
-    issuer_pk_x: issuerPkX.toString(),
-    trait_data_hash: traitDataHash.toString(),
-    nonce: nonce.toString(),
-    merkle_path: merklePath.map((h) => h.toString()),
-    merkle_path_indices: merklePathIndices,
-    // Public
-    merkle_root: merkleRoot.toString(),
-    attestation_id: schemaId.toString(),
-    external_nullifier: externalNullifier.toString(),
-    nullifier_hash: nullifierHash.toString(),
-  };
-}
-
 // =============================================================================
 // Component
 // =============================================================================
@@ -187,6 +78,16 @@ export function ProofGeneratorModal({ trait, onClose }: ProofGeneratorModalProps
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [txSig, setTxSig] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [progressStage, setProgressStage] = useState<ProofWorkerStage>("preparing-witness");
+  const proofAbortRef = useRef<AbortController | null>(null);
+
+  const handleCancelGenerate = useCallback(() => {
+    proofAbortRef.current?.abort();
+    proofAbortRef.current = null;
+    setProgress(0);
+    setStep("setup");
+  }, []);
 
   const handleGenerate = async () => {
     if (!externalNullifier.trim()) {
@@ -204,6 +105,10 @@ export function ProofGeneratorModal({ trait, onClose }: ProofGeneratorModalProps
 
     setStep("generating");
     setError(null);
+    setProgress(0);
+    setProgressStage("preparing-witness");
+    const abortController = new AbortController();
+    proofAbortRef.current = abortController;
 
     try {
       // ── Look up the announcement to get the ephemeral public key ──────────
@@ -231,22 +136,27 @@ export function ProofGeneratorModal({ trait, onClose }: ProofGeneratorModalProps
       }
 
       const masterKeys = getMasterKeys();
-
-      // Build the V2 circuit witness inputs (stealth key reconstruction,
-      // Poseidon Merkle path, nullifier) entirely in-browser.
-      const circuitInputs = await buildCircuitInputs(
-        trait,
-        externalNullifier,
-        wasm,
-        masterKeys,
-        ephemeralPubKeyBytes
+      const stealthPrivKeyBytes = wasm.reconstruct_signing_key_wasm(
+        masterKeys.spendPrivKey,
+        masterKeys.viewPrivKey,
+        ephemeralPubKeyBytes,
       );
 
-      // Generate the Groth16 proof against the V2 circuit artifacts.
-      const { proof: snarkProof, publicSignals } = await snarkjs.groth16.fullProve(
-        circuitInputs,
-        V2_CIRCUIT_WASM_PATH,
-        V2_ZKEY_PATH
+      const { proof: snarkProof, publicSignals } = await generateV2ProofInWorker(
+        {
+          stealthPrivKeyBytes: Array.from(stealthPrivKeyBytes),
+          schemaIdField: trait.merkleLeafPreimage.schemaIdField,
+          issuerPkX: trait.merkleLeafPreimage.issuerPkX,
+          nonceField: trait.merkleLeafPreimage.nonceField,
+          externalNullifierStr: externalNullifier,
+        },
+        {
+          signal: abortController.signal,
+          onProgress: (stage, percent) => {
+            setProgressStage(stage);
+            setProgress(percent);
+          },
+        },
       );
 
       const generatedProof: GeneratedProof = {
@@ -263,21 +173,20 @@ export function ProofGeneratorModal({ trait, onClose }: ProofGeneratorModalProps
       setProof(generatedProof);
       setStep("done");
     } catch (e) {
+      if (e instanceof ProofGenerationCancelledError) {
+        return;
+      }
       const msg = e instanceof Error ? e.message : String(e);
-      if (
-        msg.includes("fetch") ||
-        msg.includes("404") ||
-        msg.includes("NetworkError") ||
-        msg.includes("Failed to load")
-      ) {
+      if (msg.includes("Circuit files could not be loaded")) {
         setError(
-          "V2 circuit files not found. Run the V2 trusted setup and copy the WASM + zkey to frontend/public/circuits/v2/. " +
-            "See next_steps.md Phase 1 for instructions."
+          `${msg} For V2, run the trusted setup and copy WASM + zkey to frontend/public/circuits/v2/. See next_steps.md Phase 1.`,
         );
       } else {
         setError(msg);
       }
       setStep("error");
+    } finally {
+      proofAbortRef.current = null;
     }
   };
 
@@ -445,10 +354,29 @@ export function ProofGeneratorModal({ trait, onClose }: ProofGeneratorModalProps
           {step === "generating" && (
             <div className="flex flex-col items-center gap-4 py-6">
               <span className="h-10 w-10 animate-spin rounded-full border-2 border-ink-600 border-t-white" />
-              <p className="text-sm text-mist">Generating ZK proof locally…</p>
-              <p className="text-xs text-ink-500 text-center max-w-xs">
-                The Groth16 prover runs entirely in your browser. This may take up to a minute on slower devices.
+              <p className="text-sm text-mist">
+                {progressStage === "preparing-witness"
+                  ? "Preparing witness inputs…"
+                  : "Generating Groth16 proof…"}
               </p>
+              <p className="text-xs text-ink-500 text-center max-w-xs">
+                Proof generation runs in a background worker so the UI stays responsive.
+                This may take up to a minute on slower devices.
+              </p>
+              <div className="h-1.5 w-full max-w-xs bg-ink-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-white rounded-full transition-all duration-700 ease-out"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-ink-500">{progress}%</p>
+              <button
+                type="button"
+                onClick={handleCancelGenerate}
+                className="px-4 py-2 rounded-xl text-sm font-medium text-mist border border-ink-700 bg-ink-800 hover:bg-ink-700 transition-colors"
+              >
+                Cancel
+              </button>
             </div>
           )}
 
