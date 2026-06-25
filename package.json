@@ -6,6 +6,8 @@
     "deploy": "tsx scripts/deploy-contracts.ts",
     "deploy:testnet": "tsx scripts/deploy-contracts.ts --network testnet",
     "deploy:mainnet": "tsx scripts/deploy-contracts.ts --network mainnet",
+    "deploy:rollback": "node scripts/rollback-deployment.mjs --dry-run",
+    "health:rpc": "node scripts/probe-horizon-rpc.mjs",
     "verify:deployment": "tsx scripts/verify-deployment-manifest.ts",
     "verify:deployment:strict": "tsx scripts/verify-deployment-manifest.ts --strict",
     "verify:security-audit": "tsx scripts/verify-security-audit.ts --network mainnet",

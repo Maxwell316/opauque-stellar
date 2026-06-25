@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "1.0.0",
+  "description": "Ops health probe configuration for Stellar Horizon and Soroban RPC endpoints.",
+  "networks": {
+    "testnet": {
+      "horizon": {
+        "primary": "https://horizon-testnet.stellar.org",
+        "fallbacks": [
+          "https://rpc.ankr.com/http/stellar_testnet_horizon",
+          "https://stellar-testnet.gateway.tatum.io"
+        ]
+      },
+      "rpc": {
+        "primary": "https://soroban-testnet.stellar.org",
+        "fallbacks": [
+          "https://rpc.ankr.com/stellar_testnet_soroban"
+        ]
+      }
+    },
+    "mainnet": {
+      "horizon": {
+        "primary": "https://horizon.stellar.org",
+        "fallbacks": [
+          "https://rpc.ankr.com/http/stellar_horizon",
+          "https://stellar-mainnet.gateway.tatum.io"
+        ]
+      },
+      "rpc": {
+        "primary": "https://mainnet.sorobanrpc.com",
+        "fallbacks": [
+          "https://rpc.ankr.com/stellar_soroban"
+        ]
+      }
+    }
+  },
+  "thresholds": {
+    "timeoutMs": 10000,
+    "warnLatencyMs": 2500,
+    "maxErrorRate": 0
+  },
+  "alerting": {
+    "webhookEnv": "OPS_ALERT_WEBHOOK_URL",
+    "payloadFormat": "json",
+    "failureLogLevel": "error"
+  }
+}
