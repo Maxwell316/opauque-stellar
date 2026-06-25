@@ -79,6 +79,10 @@ fn schema_ids_key(env: &Env) -> Symbol {
     Symbol::new(env, "schema_ids")
 }
 
+fn authority_index_key(authority: &Address) -> (Symbol, Address) {
+    (Symbol::new(&authority.env(), "auth_idx"), authority.clone())
+}
+
 /// Copies a Soroban `String` into a UTF-8 `&str` backed by `buf`.
 fn soroban_string_to_str<'a>(
     s: &SorobanString,
@@ -240,6 +244,15 @@ impl SchemaRegistry {
         schema_ids.push_back(schema_id.clone());
         env.storage().persistent().set(&ids_key, &schema_ids);
 
+        let auth_key = authority_index_key(&authority);
+        let mut auth_ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&auth_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        auth_ids.push_back(schema_id.clone());
+        env.storage().persistent().set(&auth_key, &auth_ids);
+
         env.events().publish(
             (Symbol::new(&env, "SchemaRegistered"), EVENT_VERSION),
             (schema_id, authority, name),
@@ -363,6 +376,44 @@ impl SchemaRegistry {
             .persistent()
             .get(&schema_key(&schema_id))
             .expect("schema")
+    }
+
+    pub fn get_delegates(env: Env, schema_id: BytesN<32>, offset: u32, limit: u32) -> Vec<Address> {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&delegate_key(&schema_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = delegates.len();
+        let start = offset.min(len);
+        let end = (start + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            page.push_back(delegates.get(i).unwrap());
+        }
+        page
+    }
+
+    pub fn list_schemas_by_authority(
+        env: Env,
+        authority: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<BytesN<32>> {
+        let auth_key = authority_index_key(&authority);
+        let ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&auth_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = ids.len();
+        let start = offset.min(len);
+        let end = (start + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            page.push_back(ids.get(i).unwrap());
+        }
+        page
     }
 }
 
@@ -999,6 +1050,120 @@ mod test {
             &0u32,
         );
         assert_eq!(result, Err(Ok(SchemaError::InvalidSchemaId)));
+    }
+
+    fn register_named(
+        env: &Env,
+        client: &SchemaRegistryClient,
+        authority: &Address,
+        name: &str,
+        field_defs: &str,
+    ) -> BytesN<32> {
+        let schema_id = schema_id_for(env, name, field_defs, 1);
+        client.register_schema(
+            authority,
+            &authority_key(env),
+            &schema_id,
+            &SorobanString::from_str(env, name),
+            &SorobanString::from_str(env, field_defs),
+            &false,
+            &1u32,
+            &None,
+            &0u32,
+        );
+        schema_id
+    }
+
+    #[test]
+    fn get_delegates_empty_when_none() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SchemaRegistry);
+        let client = SchemaRegistryClient::new(&env, &contract_id);
+        let authority = Address::generate(&env);
+        let schema_id = register_named(&env, &client, &authority, "S", "u32 x");
+        let delegates = client.get_delegates(&schema_id, &0, &10);
+        assert_eq!(delegates.len(), 0);
+    }
+
+    #[test]
+    fn get_delegates_returns_added_delegates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SchemaRegistry);
+        let client = SchemaRegistryClient::new(&env, &contract_id);
+        let authority = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+        let schema_id = register_named(&env, &client, &authority, "D", "u32 y");
+        client.add_delegate(&authority, &schema_id, &delegate1);
+        client.add_delegate(&authority, &schema_id, &delegate2);
+        let delegates = client.get_delegates(&schema_id, &0, &10);
+        assert_eq!(delegates.len(), 2);
+        assert_eq!(delegates.get(0).unwrap(), delegate1);
+        assert_eq!(delegates.get(1).unwrap(), delegate2);
+    }
+
+    #[test]
+    fn get_delegates_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SchemaRegistry);
+        let client = SchemaRegistryClient::new(&env, &contract_id);
+        let authority = Address::generate(&env);
+        let d0 = Address::generate(&env);
+        let d1 = Address::generate(&env);
+        let d2 = Address::generate(&env);
+        let schema_id = register_named(&env, &client, &authority, "P", "u32 z");
+        client.add_delegate(&authority, &schema_id, &d0);
+        client.add_delegate(&authority, &schema_id, &d1);
+        client.add_delegate(&authority, &schema_id, &d2);
+        let page = client.get_delegates(&schema_id, &1, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), d1);
+        assert_eq!(page.get(1).unwrap(), d2);
+    }
+
+    #[test]
+    fn list_schemas_by_authority_empty_for_new_authority() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SchemaRegistry);
+        let client = SchemaRegistryClient::new(&env, &contract_id);
+        let authority = Address::generate(&env);
+        let result = client.list_schemas_by_authority(&authority, &0, &10);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn list_schemas_by_authority_returns_registered_schemas() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SchemaRegistry);
+        let client = SchemaRegistryClient::new(&env, &contract_id);
+        let authority = Address::generate(&env);
+        let id1 = register_named(&env, &client, &authority, "Aa", "u32 a");
+        let id2 = register_named(&env, &client, &authority, "Bb", "u32 b");
+        let result = client.list_schemas_by_authority(&authority, &0, &10);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get(0).unwrap(), id1);
+        assert_eq!(result.get(1).unwrap(), id2);
+    }
+
+    #[test]
+    fn list_schemas_by_authority_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SchemaRegistry);
+        let client = SchemaRegistryClient::new(&env, &contract_id);
+        let authority = Address::generate(&env);
+        register_named(&env, &client, &authority, "X1", "u32 a");
+        let id2 = register_named(&env, &client, &authority, "X2", "u32 b");
+        let id3 = register_named(&env, &client, &authority, "X3", "u32 c");
+        let page = client.list_schemas_by_authority(&authority, &1, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), id2);
+        assert_eq!(page.get(1).unwrap(), id3);
     }
 
     #[test]
