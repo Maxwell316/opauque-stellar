@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { useToast } from "../context/ToastContext";
 import { isFederationIdentifier, resolveDomain } from "../lib/ens";
 import { FeatureDisabledNotice } from "./FeatureDisabledNotice";
 import { isFeatureEnabled } from "../lib/featureFlags";
@@ -31,7 +30,6 @@ export function SubENSView({ onBack }: SubENSViewProps) {
   const [resolving, setResolving] = useState(false);
   const [resolvedAddress, setResolvedAddress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const { showToast } = useToast();
 
   const federationEnabled = isFeatureEnabled("demoVerifierLinks");
 

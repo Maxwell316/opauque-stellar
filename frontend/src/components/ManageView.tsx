@@ -18,7 +18,9 @@ import {
   bytesToHex,
   hexPubkeyToBase58,
   invokeAddDelegate,
+  invokeDeprecateSchema,
   invokeRemoveDelegate,
+  invokeRevokeAttestation,
 } from "../lib/programs";
 import type { Tab } from "./Layout";
 import { ModalShell } from "./ModalShell";
@@ -132,11 +134,12 @@ interface SchemaCardProps {
   walletAddress: string;
   signTransaction: ((xdr: string) => Promise<string>) | null;
   onAction: (msg: string, isError?: boolean) => void;
+  onDeprecated: (schema: SchemaV2, txHash: string) => void;
   onRefresh: () => void;
   readOnly?: boolean;
 }
 
-function SchemaCard({ schema, walletAddress, signTransaction, onAction, onRefresh, readOnly = false }: SchemaCardProps) {
+function SchemaCard({ schema, walletAddress, signTransaction, onAction, onDeprecated, onRefresh, readOnly = false }: SchemaCardProps) {
   const uid = useId();
 
   const [delegateInput, setDelegateInput] = useState("");
@@ -149,15 +152,30 @@ function SchemaCard({ schema, walletAddress, signTransaction, onAction, onRefres
   );
 
   const handleDeprecate = useCallback(async () => {
+    if (schema.deprecated) {
+      onAction("This schema has already been deprecated.", true);
+      return;
+    }
+    if (!signTransaction) {
+      onAction("Wallet not connected", true);
+      return;
+    }
+
     setBusy("Deprecate schema");
     try {
-      throw new Error("Schema deprecation is not yet wired to the Stellar contract.");
+      const txHash = await invokeDeprecateSchema({
+        authority: walletAddress,
+        schemaId: schemaIdBytes,
+        signTransaction,
+      });
+      onDeprecated(schema, txHash);
+      onAction(`Schema deprecated successfully. Tx: ${txHash.slice(0, 10)}...${txHash.slice(-6)}`);
     } catch (e) {
       onAction(e instanceof Error ? e.message : "Deprecate failed", true);
     } finally {
       setBusy(null);
     }
-  }, [onAction]);
+  }, [schema, walletAddress, schemaIdBytes, signTransaction, onAction, onDeprecated]);
 
   const handleAddDelegate = useCallback(async () => {
     const addr = delegateInput.trim();
@@ -338,23 +356,38 @@ function SchemaCard({ schema, walletAddress, signTransaction, onAction, onRefres
 
 interface AttestationCardProps {
   att: ManagedAttestation;
+  revoker: string;
+  signTransaction: ((xdr: string) => Promise<string>) | null;
+  onRevoked: (attestationUid: string, txHash: string) => void;
   onAction: (msg: string, isError?: boolean) => void;
   readOnly?: boolean;
 }
 
-function AttestationCard({ att, onAction, readOnly = false }: AttestationCardProps) {
+function AttestationCard({ att, revoker, signTransaction, onRevoked, onAction, readOnly = false }: AttestationCardProps) {
   const [revoking, setRevoking] = useState(false);
   const [confirmRevokeOpen, setConfirmRevokeOpen] = useState(false);
 
   const handleRevoke = async () => {
+    if (att.isRevoked) {
+      onAction("This attestation has already been revoked.", true);
+      return;
+    }
+    if (!signTransaction) {
+      onAction("Wallet not connected", true);
+      return;
+    }
+
     setRevoking(true);
     try {
-      throw new Error("Revocation is not available until the Stellar management contract method is wired.");
+      const txHash = await invokeRevokeAttestation({
+        revoker,
+        uid: att.uid,
+        signTransaction,
+      });
+      onRevoked(att.uidHex, txHash);
+      onAction(`Attestation revoked. Tx: ${txHash.slice(0, 10)}...${txHash.slice(-6)}`);
     } catch (e: unknown) {
-      const msg =
-        (e as { logs?: string[] })?.logs?.find((l: string) => l.includes("Error"))
-        ?? (e instanceof Error ? e.message : "Revocation failed");
-      onAction(msg, true);
+      onAction(e instanceof Error ? e.message : "Revocation failed", true);
     } finally {
       setRevoking(false);
     }
@@ -460,6 +493,8 @@ interface ManageViewProps {
 export function ManageView({ onNavigate, readOnly = false }: ManageViewProps = {}) {
   const { address: walletAddress, publicKey, connection, signTransaction } = useWallet();
   const schemaMap = useSchemaStore((s) => s.schemas);
+  const addSchema = useSchemaStore((s) => s.addSchema);
+  const markTraitInvalid = useSchemaStore((s) => s.markTraitInvalid);
 
   const [attestations, setAttestations] = useState<ManagedAttestation[]>([]);
   const [loading, setLoading] = useState(false);
@@ -481,6 +516,27 @@ export function ManageView({ onNavigate, readOnly = false }: ManageViewProps = {
     setToast({ msg, isError });
     setTimeout(() => setToast(null), 4000);
   }, []);
+
+  const handleSchemaDeprecated = useCallback((schema: SchemaV2) => {
+    addSchema({ ...schema, deprecated: true });
+  }, [addSchema]);
+
+  const handleAttestationRevoked = useCallback((uidHex: string) => {
+    const clean = uidHex.replace(/^0x/, "").toLowerCase();
+    markTraitInvalid(clean);
+    markTraitInvalid(`0x${clean}`);
+    setAttestations((current) =>
+      current.map((att) =>
+        att.uidHex.replace(/^0x/, "").toLowerCase() === clean
+          ? {
+              ...att,
+              isRevoked: true,
+              revocationSlot: att.revocationSlot > 0n ? att.revocationSlot : 1n,
+            }
+          : att,
+      ),
+    );
+  }, [markTraitInvalid]);
 
   // Filter attestations by recipient stealth address hash search
   const filteredAttestations = useMemo(() => {
@@ -660,6 +716,7 @@ export function ManageView({ onNavigate, readOnly = false }: ManageViewProps = {
                     walletAddress={walletAddress ?? ""}
                     signTransaction={signTransaction ?? null}
                     onAction={showToast}
+                    onDeprecated={handleSchemaDeprecated}
                     onRefresh={() => void load()}
                     readOnly={readOnly}
                   />
@@ -756,11 +813,11 @@ export function ManageView({ onNavigate, readOnly = false }: ManageViewProps = {
                   <AttestationCard
                     key={att.uidHex}
                     att={att}
+                    revoker={walletAddress}
+                    signTransaction={signTransaction ?? null}
+                    onRevoked={handleAttestationRevoked}
                     readOnly={readOnly}
-                    onAction={(msg, isError) => {
-                      showToast(msg, isError);
-                      if (!isError) void load(); // refresh after successful revoke
-                    }}
+                    onAction={showToast}
                   />
                 ))}
               </div>

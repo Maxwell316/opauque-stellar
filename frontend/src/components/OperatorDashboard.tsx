@@ -47,39 +47,50 @@ function useMockIndexerLag(): number {
   return lag;
 }
 
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(interval);
+  }, [intervalMs]);
+
+  return now;
+}
+
 // ---------------------------------------------------------------------------
 // Announcement count over the past 24 h from ProtocolLogContext
 // ---------------------------------------------------------------------------
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1_000;
 
-function useAnnouncementCount(): number {
+function useAnnouncementCount(now: number): number {
   const { entries } = useProtocolLog();
   return useMemo(() => {
-    const cutoff = Date.now() - ONE_DAY_MS;
+    const cutoff = now - ONE_DAY_MS;
     return entries.filter(
       (e) =>
         e.timestamp >= cutoff &&
         (e.message.toLowerCase().includes("announce") ||
           e.source === "blockchain"),
     ).length;
-  }, [entries]);
+  }, [entries, now]);
 }
 
 // ---------------------------------------------------------------------------
 // Proofs verified count (mock — derived from log entries mentioning "proof")
 // ---------------------------------------------------------------------------
 
-function useProofsVerified(): number {
+function useProofsVerified(now: number): number {
   const { entries } = useProtocolLog();
   return useMemo(() => {
-    const cutoff = Date.now() - ONE_DAY_MS;
+    const cutoff = now - ONE_DAY_MS;
     return entries.filter(
       (e) =>
         e.timestamp >= cutoff &&
         e.message.toLowerCase().includes("proof"),
     ).length;
-  }, [entries]);
+  }, [entries, now]);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,10 +101,15 @@ export function OperatorDashboard() {
   const [isOperator, setIsOperator] = useState(() => isOperatorAuthenticated());
   const [secretInput, setSecretInput] = useState("");
   const [authError, setAuthError] = useState<string | null>(null);
+  const now = useNow(60_000);
 
-  const announcementCount = useAnnouncementCount();
+  const announcementCount = useAnnouncementCount(now);
   const indexerLag = useMockIndexerLag();
-  const proofsVerified = useProofsVerified();
+  const proofsVerified = useProofsVerified(now);
+  const sparklineValues = useMemo(
+    () => Array.from({ length: 12 }, (_, i) => (i === 11 ? indexerLag : (i * 3 + indexerLag) % 6)),
+    [indexerLag],
+  );
 
   const handleAuth = (e: React.FormEvent) => {
     e.preventDefault();
@@ -182,8 +198,7 @@ export function OperatorDashboard() {
       <div className="rounded-xl border border-ink-700 bg-ink-900/60 p-4">
         <p className="text-xs text-mist mb-2">Indexer lag — last reading</p>
         <div className="flex items-end gap-1 h-10">
-          {Array.from({ length: 12 }, (_, i) => {
-            const h = i === 11 ? indexerLag : Math.floor(Math.random() * 6);
+          {sparklineValues.map((h, i) => {
             const pct = Math.max(8, (h / 5) * 100);
             return (
               <div
