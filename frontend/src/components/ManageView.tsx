@@ -17,6 +17,8 @@ import type { SchemaV2 } from "../lib/schema";
 import {
   bytesToHex,
   hexPubkeyToBase58,
+  invokeAddDelegate,
+  invokeRemoveDelegate,
 } from "../lib/programs";
 import type { Tab } from "./Layout";
 import { ModalShell } from "./ModalShell";
@@ -127,39 +129,82 @@ function PaginationControls({
 
 interface SchemaCardProps {
   schema: SchemaV2;
+  walletAddress: string;
+  signTransaction: ((xdr: string) => Promise<string>) | null;
   onAction: (msg: string, isError?: boolean) => void;
+  onRefresh: () => void;
   readOnly?: boolean;
 }
 
-function SchemaCard({ schema, onAction, readOnly = false }: SchemaCardProps) {
+function SchemaCard({ schema, walletAddress, signTransaction, onAction, onRefresh, readOnly = false }: SchemaCardProps) {
   const uid = useId();
 
   const [delegateInput, setDelegateInput] = useState("");
-  const [busy, setBusy] = useState<string | null>(null); // action label currently running
+  const [busy, setBusy] = useState<string | null>(null);
   const [confirmDeprecateOpen, setConfirmDeprecateOpen] = useState(false);
 
-  const runUnavailableAction = useCallback(async (label: string) => {
-    setBusy(label);
+  const schemaIdBytes = useMemo(
+    () => Uint8Array.from(Buffer.from(schema.schemaId.replace(/^0x/, ""), "hex")),
+    [schema.schemaId],
+  );
+
+  const handleDeprecate = useCallback(async () => {
+    setBusy("Deprecate schema");
     try {
-      throw new Error(`${label} is not available until the Stellar management contract methods are wired.`);
+      throw new Error("Schema deprecation is not yet wired to the Stellar contract.");
     } catch (e) {
-      onAction(e instanceof Error ? e.message : `${label} failed`, true);
+      onAction(e instanceof Error ? e.message : "Deprecate failed", true);
     } finally {
       setBusy(null);
-      setDelegateInput("");
     }
   }, [onAction]);
 
-  const handleDeprecate = () => runUnavailableAction("Deprecate schema");
+  const handleAddDelegate = useCallback(async () => {
+    const addr = delegateInput.trim();
+    if (!addr) return;
+    if (!signTransaction) {
+      onAction("Wallet not connected", true);
+      return;
+    }
+    setBusy("Add delegate");
+    try {
+      await invokeAddDelegate({
+        authority: walletAddress,
+        schemaId: schemaIdBytes,
+        delegate: addr,
+        signTransaction,
+      });
+      setDelegateInput("");
+      onAction(`Delegate ${addr.slice(0, 6)}… added`);
+      onRefresh();
+    } catch (e) {
+      onAction(e instanceof Error ? e.message : "Add delegate failed", true);
+    } finally {
+      setBusy(null);
+    }
+  }, [delegateInput, walletAddress, schemaIdBytes, signTransaction, onAction, onRefresh]);
 
-  const handleAddDelegate = () => {
-    if (!delegateInput.trim()) return;
-    void runUnavailableAction("Add delegate");
-  };
-
-  const handleRemoveDelegate = (_delegateAddr: string) => {
-    void runUnavailableAction("Remove delegate");
-  };
+  const handleRemoveDelegate = useCallback(async (delegateAddr: string) => {
+    if (!signTransaction) {
+      onAction("Wallet not connected", true);
+      return;
+    }
+    setBusy("Remove delegate");
+    try {
+      await invokeRemoveDelegate({
+        authority: walletAddress,
+        schemaId: schemaIdBytes,
+        delegate: delegateAddr,
+        signTransaction,
+      });
+      onAction(`Delegate ${delegateAddr.slice(0, 6)}… removed`);
+      onRefresh();
+    } catch (e) {
+      onAction(e instanceof Error ? e.message : "Remove delegate failed", true);
+    } finally {
+      setBusy(null);
+    }
+  }, [walletAddress, schemaIdBytes, signTransaction, onAction, onRefresh]);
 
   const isBusy = busy !== null;
 
@@ -193,7 +238,7 @@ function SchemaCard({ schema, onAction, readOnly = false }: SchemaCardProps) {
                   <button
                     type="button"
                     disabled={isBusy || schema.deprecated || readOnly}
-                    onClick={() => handleRemoveDelegate(d)}
+                    onClick={() => void handleRemoveDelegate(d)}
                     className="text-xs text-neutral-400 hover:text-neutral-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                   >
                     {busy === "Remove delegate" ? "…" : "Remove"}
@@ -217,7 +262,7 @@ function SchemaCard({ schema, onAction, readOnly = false }: SchemaCardProps) {
               />
               <button
                 type="button"
-                onClick={handleAddDelegate}
+                onClick={() => void handleAddDelegate()}
                 disabled={isBusy || !delegateInput.trim()}
                 className="rounded-lg bg-ink-700 hover:bg-ink-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
@@ -236,7 +281,7 @@ function SchemaCard({ schema, onAction, readOnly = false }: SchemaCardProps) {
               disabled={isBusy}
               className="w-full rounded-lg border border-neutral-500/30 bg-neutral-500/5 hover:bg-neutral-500/10 px-4 py-2 text-xs font-medium text-neutral-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              {busy === "Deprecate" ? "Deprecating…" : "Deprecate Schema"}
+              {busy === "Deprecate schema" ? "Deprecating…" : "Deprecate Schema"}
             </button>
             <p className="text-[11px] text-ink-500 mt-1.5 text-center">
               Deprecation is irreversible — no new attestations can be issued under this schema.
@@ -413,7 +458,7 @@ interface ManageViewProps {
 }
 
 export function ManageView({ onNavigate, readOnly = false }: ManageViewProps = {}) {
-  const { address: walletAddress, publicKey, connection } = useWallet();
+  const { address: walletAddress, publicKey, connection, signTransaction } = useWallet();
   const schemaMap = useSchemaStore((s) => s.schemas);
 
   const [attestations, setAttestations] = useState<ManagedAttestation[]>([]);
@@ -609,7 +654,15 @@ export function ManageView({ onNavigate, readOnly = false }: ManageViewProps = {
             <div className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {pagedSchemas.map((schema) => (
-                  <SchemaCard key={schema.schemaId} schema={schema} onAction={showToast} readOnly={readOnly} />
+                  <SchemaCard
+                    key={schema.schemaId}
+                    schema={schema}
+                    walletAddress={walletAddress ?? ""}
+                    signTransaction={signTransaction ?? null}
+                    onAction={showToast}
+                    onRefresh={() => void load()}
+                    readOnly={readOnly}
+                  />
                 ))}
               </div>
               <PaginationControls

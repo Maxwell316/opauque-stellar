@@ -81,6 +81,7 @@ pub enum ReputationError {
     AlreadyInitialized = 5,
     AttestationExpired = 6,
     InvalidDatasetHash = 7,
+    ContractFrozen = 8,
 }
 
 fn root_key(root: &BytesN<32>) -> (Symbol, BytesN<32>) {
@@ -93,6 +94,14 @@ fn nullifier_key(n: &BytesN<32>) -> (Symbol, BytesN<32>) {
 
 fn history_key(env: &Env) -> Symbol {
     Symbol::new(env, "root_history")
+}
+
+fn frozen_key(env: &Env) -> Symbol {
+    Symbol::new(env, "frozen")
+}
+
+fn last_root_update_key(env: &Env) -> Symbol {
+    Symbol::new(env, "last_root_upd")
 }
 
 #[contractimpl]
@@ -165,6 +174,32 @@ impl ReputationVerifier {
         page
     }
 
+    pub fn is_frozen(env: Env) -> bool {
+        env.storage().instance().get(&frozen_key(&env)).unwrap_or(false)
+    }
+
+    pub fn set_frozen(env: Env, admin: Address, frozen: bool) -> Result<(), ReputationError> {
+        admin.require_auth();
+        let config: VerifierConfig = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "config"))
+            .expect("config");
+        if config.admin != admin {
+            return Err(ReputationError::Unauthorized);
+        }
+        env.storage().instance().set(&frozen_key(&env), &frozen);
+        env.events().publish(
+            (Symbol::new(&env, "FreezeStatusChanged"), EVENT_VERSION),
+            (frozen, admin),
+        );
+        Ok(())
+    }
+
+    pub fn last_root_update(env: Env) -> u32 {
+        env.storage().instance().get(&last_root_update_key(&env)).unwrap_or(0u32)
+    }
+
     pub fn update_merkle_root(
         env: Env,
         admin: Address,
@@ -172,6 +207,9 @@ impl ReputationVerifier {
         dataset_hash: BytesN<32>,
     ) -> Result<(), ReputationError> {
         admin.require_auth();
+        if env.storage().instance().get(&frozen_key(&env)).unwrap_or(false) {
+            return Err(ReputationError::ContractFrozen);
+        }
         let config: VerifierConfig = env
             .storage()
             .instance()
@@ -199,6 +237,7 @@ impl ReputationVerifier {
         }
         history.push_back(root.clone());
         env.storage().instance().set(&history_key(&env), &history);
+        env.storage().instance().set(&last_root_update_key(&env), &ledger);
 
         env.events().publish(
             (Symbol::new(&env, "MerkleRootPublished"), EVENT_VERSION),
@@ -837,5 +876,79 @@ mod test {
         // History is capped at MAX_ROOT_HISTORY (100)
         let all = client.get_root_history(&0u32, &200u32);
         assert_eq!(all.len(), 100u32);
+    }
+
+    #[test]
+    fn test_is_frozen_defaults_to_false() {
+        let (env, _, _, client, _) = setup_with_mock();
+        let _ = env;
+        assert!(!client.is_frozen());
+    }
+
+    #[test]
+    fn test_set_frozen_by_admin_succeeds() {
+        let (env, admin, _, client, _) = setup_with_mock();
+        let _ = env;
+        client.set_frozen(&admin, &true);
+        assert!(client.is_frozen());
+        client.set_frozen(&admin, &false);
+        assert!(!client.is_frozen());
+    }
+
+    #[test]
+    fn test_set_frozen_unauthorized_rejected() {
+        let (env, _, _, client, _) = setup_with_mock();
+        let impostor = Address::generate(&env);
+        env.mock_all_auths();
+        let result = client.try_set_frozen(&impostor, &true);
+        assert_eq!(result, Err(Ok(ReputationError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_update_merkle_root_blocked_when_frozen() {
+        let (env, admin, _, client, _) = setup_with_mock();
+        let _ = env;
+        client.set_frozen(&admin, &true);
+        let root = BytesN::from_array(&env, &[0xaau8; 32]);
+        let result = client.try_update_merkle_root(&admin, &root, &root);
+        assert_eq!(result, Err(Ok(ReputationError::ContractFrozen)));
+    }
+
+    #[test]
+    fn test_update_merkle_root_succeeds_after_unfreeze() {
+        let (env, admin, _, client, _) = setup_with_mock();
+        client.set_frozen(&admin, &true);
+        client.set_frozen(&admin, &false);
+        let root = BytesN::from_array(&env, &[0xbbu8; 32]);
+        client.update_merkle_root(&admin, &root, &root);
+        assert!(!client.is_frozen());
+    }
+
+    #[test]
+    fn test_last_root_update_is_zero_before_any_publish() {
+        let (env, _, _, client, _) = setup_with_mock();
+        let _ = env;
+        assert_eq!(client.last_root_update(), 0u32);
+    }
+
+    #[test]
+    fn test_last_root_update_reflects_ledger_after_publish() {
+        let (env, admin, _, client, _) = setup_with_mock();
+        env.ledger().set_sequence_number(42);
+        let root = BytesN::from_array(&env, &[0xccu8; 32]);
+        client.update_merkle_root(&admin, &root, &root);
+        assert_eq!(client.last_root_update(), 42u32);
+    }
+
+    #[test]
+    fn test_last_root_update_tracks_latest_publish() {
+        let (env, admin, _, client, _) = setup_with_mock();
+        env.ledger().set_sequence_number(10);
+        let root1 = BytesN::from_array(&env, &[0x01u8; 32]);
+        client.update_merkle_root(&admin, &root1, &root1);
+        env.ledger().set_sequence_number(20);
+        let root2 = BytesN::from_array(&env, &[0x02u8; 32]);
+        client.update_merkle_root(&admin, &root2, &root2);
+        assert_eq!(client.last_root_update(), 20u32);
     }
 }

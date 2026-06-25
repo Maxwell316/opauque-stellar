@@ -132,14 +132,55 @@ export function buildDeprecateSchemaInstruction(): never {
   throw new Error("Schema deprecation on Stellar is not yet implemented in the UI");
 }
 
+export async function invokeAddDelegate(opts: {
+  authority: string;
+  schemaId: Uint8Array;
+  delegate: string;
+  signTransaction: SignTxFn;
+}): Promise<string> {
+  if (!opts.delegate.startsWith("G") || opts.delegate.length !== 56) {
+    throw new Error("Invalid delegate address: must be a Stellar G-address (56 chars)");
+  }
+  return invokeContractMethod({
+    sourcePublicKey: opts.authority,
+    contractId: SCHEMA_REGISTRY_CONTRACT_ID,
+    method: "add_delegate",
+    args: [
+      nativeToScVal(opts.authority, { type: "address" }),
+      nativeToScVal(Buffer.from(opts.schemaId), { type: "bytes" }),
+      nativeToScVal(opts.delegate, { type: "address" }),
+    ],
+    signTransaction: opts.signTransaction,
+  });
+}
+
+export async function invokeRemoveDelegate(opts: {
+  authority: string;
+  schemaId: Uint8Array;
+  delegate: string;
+  signTransaction: SignTxFn;
+}): Promise<string> {
+  return invokeContractMethod({
+    sourcePublicKey: opts.authority,
+    contractId: SCHEMA_REGISTRY_CONTRACT_ID,
+    method: "remove_delegate",
+    args: [
+      nativeToScVal(opts.authority, { type: "address" }),
+      nativeToScVal(Buffer.from(opts.schemaId), { type: "bytes" }),
+      nativeToScVal(opts.delegate, { type: "address" }),
+    ],
+    signTransaction: opts.signTransaction,
+  });
+}
+
 /** @deprecated */
 export function buildAddDelegateInstruction(): never {
-  throw new Error("Delegate management on Stellar is not yet implemented in the UI");
+  throw new Error("Use invokeAddDelegate() on Stellar");
 }
 
 /** @deprecated */
 export function buildRemoveDelegateInstruction(): never {
-  throw new Error("Delegate management on Stellar is not yet implemented in the UI");
+  throw new Error("Use invokeRemoveDelegate() on Stellar");
 }
 
 /** @deprecated */
