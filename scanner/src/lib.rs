@@ -9,9 +9,16 @@ use log::{info, warn};
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
-/// The only event schema version this scanner understands.
-/// Announcements carrying a different version are skipped with a console warning.
+/// v1 event schema version — the original layout.
 const SUPPORTED_EVENT_VERSION: u32 = 1;
+/// v2 event schema version — extended payload, accepted alongside v1 during
+/// the deprecation window (see docs/rfcs/0002-event-schema-v2-migration.md).
+const SUPPORTED_EVENT_VERSION_V2: u32 = 2;
+
+/// Returns true for any event schema version this scanner can process.
+fn is_supported_event_version(ver: u32) -> bool {
+    ver == SUPPORTED_EVENT_VERSION || ver == SUPPORTED_EVENT_VERSION_V2
+}
 
 mod attestation;
 mod merkle;
@@ -317,15 +324,16 @@ pub fn scan_attestations_wasm(
 
     let mut announcements = Vec::with_capacity(raw_anns.len());
     for ann in &raw_anns {
-        // Issue #50: skip announcements whose event_version is present but unsupported.
+        // Issue #50 / #374: skip announcements whose event_version is present but unsupported.
+        // Accepts v1 and v2 during the dual-publish deprecation window.
         if let Some(ver) = ann["eventVersion"].as_u64().map(|v| v as u32) {
-            if ver != SUPPORTED_EVENT_VERSION {
+            if !is_supported_event_version(ver) {
                 #[cfg(target_arch = "wasm32")]
                 web_sys::console::warn_1(
-                    &format!("Skipping announcement with unsupported event_version {ver}; expected {SUPPORTED_EVENT_VERSION}").into(),
+                    &format!("Skipping announcement with unsupported event_version {ver}; supported: {SUPPORTED_EVENT_VERSION},{SUPPORTED_EVENT_VERSION_V2}").into(),
                 );
                 #[cfg(not(target_arch = "wasm32"))]
-                eprintln!("Skipping announcement with unsupported event_version {ver}; expected {SUPPORTED_EVENT_VERSION}");
+                eprintln!("Skipping announcement with unsupported event_version {ver}; supported: {SUPPORTED_EVENT_VERSION},{SUPPORTED_EVENT_VERSION_V2}");
                 continue;
             }
         }
@@ -575,15 +583,16 @@ pub fn scan_attestations_v2_wasm(
 
     let mut announcements = Vec::with_capacity(raw_anns.len());
     for ann in &raw_anns {
-        // Issue #50: skip unsupported event schema versions with telemetry.
+        // Issue #50 / #374: skip unsupported event schema versions with telemetry.
+        // Accepts v1 and v2 during the dual-publish deprecation window.
         if let Some(ver) = ann["eventVersion"].as_u64().map(|v| v as u32) {
-            if ver != SUPPORTED_EVENT_VERSION {
+            if !is_supported_event_version(ver) {
                 #[cfg(target_arch = "wasm32")]
                 web_sys::console::warn_1(
-                    &format!("Skipping V2 announcement with unsupported event_version {ver}; expected {SUPPORTED_EVENT_VERSION}").into(),
+                    &format!("Skipping V2 announcement with unsupported event_version {ver}; supported: {SUPPORTED_EVENT_VERSION},{SUPPORTED_EVENT_VERSION_V2}").into(),
                 );
                 #[cfg(not(target_arch = "wasm32"))]
-                eprintln!("Skipping V2 announcement with unsupported event_version {ver}; expected {SUPPORTED_EVENT_VERSION}");
+                eprintln!("Skipping V2 announcement with unsupported event_version {ver}; supported: {SUPPORTED_EVENT_VERSION},{SUPPORTED_EVENT_VERSION_V2}");
                 continue;
             }
         }

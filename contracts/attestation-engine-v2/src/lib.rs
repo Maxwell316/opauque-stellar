@@ -19,6 +19,9 @@ pub struct AttestationEngineV2;
 /// Current event schema version — increment when the event topic/data layout changes.
 /// Scanners should reject events with an unrecognised version rather than misparse them.
 const EVENT_VERSION: u32 = 1;
+/// v2 events carry an extended payload; emitted alongside v1 during the deprecation window.
+/// See docs/rfcs/0002-event-schema-v2-migration.md for the sunset timeline.
+const EVENT_VERSION_V2: u32 = 2;
 const MAX_ATTESTATION_PAYLOAD_LEN: u32 = 512;
 
 #[contracttype]
@@ -344,9 +347,15 @@ impl AttestationEngineV2 {
         env.storage().persistent().set(&key, &attestation);
         bump_instance_counter(&env, issued_count_key(&env), 1);
         bump_instance_counter(&env, active_count_key(&env), 1);
+        // v1 — retained for scanner backward-compatibility (see RFC 0002 for sunset date).
         env.events().publish(
             (Symbol::new(&env, "AttestationCreated"), EVENT_VERSION),
-            (uid.clone(), schema_id, issuer, stealth_address_hash),
+            (uid.clone(), schema_id.clone(), issuer.clone(), stealth_address_hash.clone()),
+        );
+        // v2 — extended payload with lifecycle fields.
+        env.events().publish(
+            (Symbol::new(&env, "AttestationCreated"), EVENT_VERSION_V2),
+            (uid.clone(), schema_id, issuer, stealth_address_hash, ledger, expiration_ledger),
         );
         Ok(uid)
     }
@@ -430,9 +439,15 @@ impl AttestationEngineV2 {
         env.storage().persistent().set(&key, &attestation);
         bump_instance_counter(&env, active_count_key(&env), -1);
         bump_instance_counter(&env, revoked_count_key(&env), 1);
+        // v1 — retained for scanner backward-compatibility (see RFC 0002 for sunset date).
         env.events().publish(
             (Symbol::new(&env, "AttestationRevoked"), EVENT_VERSION),
-            (uid, revoker),
+            (uid.clone(), revoker.clone()),
+        );
+        // v2 — includes revocation ledger and schema for richer indexing.
+        env.events().publish(
+            (Symbol::new(&env, "AttestationRevoked"), EVENT_VERSION_V2),
+            (uid, revoker, attestation.revocation_ledger, attestation.schema_id.clone()),
         );
         Ok(())
     }
