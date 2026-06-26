@@ -84,6 +84,18 @@ src/
 2. WASM scanner filters by view tag and derives matching stealth keys.
 3. Sweep via native XLM payment to the user’s main account.
 
+### WASM scanner upgrades
+
+The scanner supports the event schema version declared in the frontend. If the Private Balance status warns that newer announcement events were skipped, update the scanner artifacts before rescanning:
+
+```bash
+npm run build:scanner --prefix ..
+npm run prepare:frontend --prefix ..
+npm run build
+```
+
+Commit the rebuilt `frontend/public/pkg/` output plus any updated artifact hashes required by `../artifacts/manifest.json`.
+
 ### ZK reputation
 
 1. Witness from discovered attestation + Merkle path.

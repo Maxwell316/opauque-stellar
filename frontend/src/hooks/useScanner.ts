@@ -29,6 +29,9 @@ import {
   logSyncError,
 } from "../lib/syncErrorUtils";
 import { getStoredGhostEntries } from "../store/ghostAddressStore";
+import { getManifestForNetwork } from "../contracts/deploymentManifest";
+
+const SUPPORTED_EVENT_VERSION = 1;
 
 /**
  * Minimal chain-read surface the scanner needs. Backed by the Horizon-derived
@@ -36,6 +39,7 @@ import { getStoredGhostEntries } from "../store/ghostAddressStore";
  */
 export interface ScannerConnection {
   getBalance: (address: string) => Promise<bigint>;
+  getTokenBalances?: (address: string) => Promise<Record<string, bigint>>;
   getSlot: () => Promise<number>;
 }
 
@@ -50,6 +54,8 @@ export type ScanProgress = {
   toBlock: bigint;
   currentBlock: bigint;
   error: string | null;
+  warning: string | null;
+  unsupportedEventVersionCount: number;
 };
 
 export type UseScannerOptions = {
@@ -72,16 +78,11 @@ export type UseScannerResult = {
   progress: ScanProgress;
   /** Native balance per ghost/watchlist address (manual scan). Use for displaying/claiming manual receives. */
   ghostBalances: Record<string, bigint>;
-  // #111: opaque-mainnet-v1 is XLM-only. Asset / token balances are
-  // explicitly out of v1 scope; the field
-  // below was previously marked "reserved for future use" but the
-  // shape stays empty in v1. Keeping the key (always `{}`) so
-  // downstream consumers don't have to fork their types on v1 vs the
-  // multi-asset follow-up.
+  /** Trustline balances per ghost/watchlist address, keyed as "CODE:ISSUER". */
   ghostTokenBalances: Record<string, Record<string, bigint>>;
   /** Whether we are in "back-fill" (cache was empty, scanning from START_BLOCK) */
   isBackfilling: boolean;
-  /** Trigger a full rescan from deployment block (clears cache for this chain) */
+  /** Trigger a full rescan from ledger 1 (clears cache for this chain) */
   retrySync: () => Promise<void>;
   /** Re-run scan from lastScannedSlot+1 to latest (incremental) */
   refresh: () => Promise<void>;
@@ -89,8 +90,20 @@ export type UseScannerResult = {
   markSyncComplete: () => void;
 };
 
-function getStartBlock(_cluster: StellarNetwork): bigint {
-  return 1n; // Soroban events start from ledger 1
+export function getStartBlock(cluster: StellarNetwork, fullRescan = false): bigint {
+  if (fullRescan) return 1n;
+  const manifest = getManifestForNetwork(cluster);
+  if (!manifest) return 1n;
+  if (
+    manifest.deploymentLedger == null ||
+    !Number.isSafeInteger(manifest.deploymentLedger) ||
+    manifest.deploymentLedger < 1
+  ) {
+    throw new Error(
+      `[Opaque] Missing deploymentLedger in deployments/v1/${cluster}.json. Set the manifest deployment ledger, or use Full Rescan to scan from ledger 1.`,
+    );
+  }
+  return BigInt(manifest.deploymentLedger);
 }
 
 function getSubgraphUrl(_cluster: StellarNetwork): string | null {
@@ -110,7 +123,7 @@ async function fetchLogsAdaptive(
   fromBlock: bigint,
   toBlock: bigint,
   _cluster: StellarNetwork,
-  onChunk: (from: bigint, to: bigint, logs: CachedAnnouncement[]) => Promise<void>
+  onChunk: (from: bigint, to: bigint, logs: CachedAnnouncement[], skippedUnsupportedVersions: number) => Promise<void>
 ): Promise<void> {
   const publicClient = getSorobanServer();
   let currentFrom = fromBlock;
@@ -131,10 +144,16 @@ async function fetchLogsAdaptive(
       ],
     });
 
-    const mapped: CachedAnnouncement[] = response.events.map((ev) => {
+    let skippedUnsupportedVersions = 0;
+    const mapped: CachedAnnouncement[] = response.events.flatMap((ev) => {
+      const eventVersion = readEventVersion(ev);
+      if (eventVersion != null && eventVersion > SUPPORTED_EVENT_VERSION) {
+        skippedUnsupportedVersions += 1;
+        return [];
+      }
       // Event value is (scheme_id, stealth_address, caller, ephemeral_pub_key, metadata)
       const val = scValToNative(ev.value) as Uint8Array[];
-      return {
+      return [{
         id: `${ev.txHash}:${ev.ledger}`,
         cluster: _cluster,
         transactionSignature: ev.txHash,
@@ -145,12 +164,46 @@ async function fetchLogsAdaptive(
           ephemeralPubKey: "0x" + Buffer.from(val[3]).toString("hex"),
           metadata: "0x" + Buffer.from(val[4]).toString("hex"),
         },
-      };
+      }];
     });
 
-    await onChunk(currentFrom, currentTo, mapped);
+    await onChunk(currentFrom, currentTo, mapped, skippedUnsupportedVersions);
     currentFrom = currentTo + 1n;
   }
+}
+
+function readEventVersion(ev: unknown): number | null {
+  const topics =
+    typeof ev === "object" && ev !== null && "topic" in ev
+      ? (ev as { topic?: unknown[] }).topic
+      : typeof ev === "object" && ev !== null && "topics" in ev
+        ? (ev as { topics?: unknown[] }).topics
+        : undefined;
+  if (!Array.isArray(topics) || topics.length < 2) return null;
+  const rawVersion = topics[1];
+  try {
+    const native = rawVersion instanceof xdr.ScVal ? scValToNative(rawVersion) : rawVersion;
+    if (typeof native === "number") return native;
+    if (typeof native === "bigint") return Number(native);
+    if (typeof native === "string") {
+      try {
+        const fromXdr = scValToNative(xdr.ScVal.fromXDR(native, "base64"));
+        const parsedFromXdr = Number(fromXdr);
+        if (Number.isFinite(parsedFromXdr)) return parsedFromXdr;
+      } catch {
+        // Fall back to numeric strings below.
+      }
+      const parsed = Number(native);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    if (typeof native === "object" && native !== null && "value" in native) {
+      const parsed = Number((native as { value: unknown }).value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 async function checkWatchlistBalances(
@@ -165,6 +218,13 @@ async function checkWatchlistBalances(
       eth[addr] = await connection.getBalance(addr);
     } catch {
       eth[addr] = 0n;
+    }
+    if (connection.getTokenBalances) {
+      try {
+        tokensOut[addr] = await connection.getTokenBalances(addr);
+      } catch {
+        tokensOut[addr] = {};
+      }
     }
   }
   return { eth, tokens: tokensOut };
@@ -222,6 +282,8 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
     toBlock: 0n,
     currentBlock: 0n,
     error: null,
+    warning: null,
+    unsupportedEventVersionCount: 0,
   });
   const [isBackfilling, setIsBackfilling] = useState(false);
   const refreshKeyRef = useRef(0);
@@ -233,25 +295,42 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
       fromBlock: bigint,
       toBlock: bigint,
       cacheEmpty: boolean,
-      startBlock: bigint
+      startBlock: bigint,
+      phaseOverride?: "backfilling" | "syncing",
+      messagePrefix?: string,
     ) => {
       await fetchLogsAdaptive(
         announcerAddress,
         fromBlock,
         toBlock,
         cluster!,
-        async (_from, end, logs) => {
+        async (_from, end, logs, skippedUnsupportedVersions) => {
           await putAnnouncements(cluster!, logs);
           await setSyncState(cluster!, Number(end));
           const totalBlocks = Number(toBlock - (cacheEmpty ? startBlock : fromBlock) + 1n);
           const doneBlocks = Number(end - (cacheEmpty ? startBlock : fromBlock) + 1n);
           const percent = totalBlocks > 0 ? Math.min(100, Math.round((doneBlocks / totalBlocks) * 100)) : 100;
+          if (skippedUnsupportedVersions > 0) {
+            console.warn(
+              `[useScanner] Skipped ${skippedUnsupportedVersions} announcement event(s) with unsupported event_version > ${SUPPORTED_EVENT_VERSION}.`,
+            );
+          }
           setProgress((p: ScanProgress) => ({
             ...p,
-            phase: cacheEmpty ? "backfilling" : "syncing",
+            phase: phaseOverride ?? (cacheEmpty ? "backfilling" : "syncing"),
             percent,
-            message: cacheEmpty ? `Optimizing Vault… [${percent}%]` : `Syncing… ${percent}%`,
+            message: messagePrefix
+              ? `${messagePrefix}… ${percent}%`
+              : cacheEmpty
+                ? `Optimizing Vault… [${percent}%]`
+                : `Syncing… ${percent}%`,
             currentBlock: end,
+            warning:
+              skippedUnsupportedVersions > 0 || p.unsupportedEventVersionCount > 0
+                ? "Some announcements use a newer scanner event version and were skipped."
+                : p.warning,
+            unsupportedEventVersionCount:
+              p.unsupportedEventVersionCount + skippedUnsupportedVersions,
           }));
         }
       );
@@ -261,7 +340,7 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
   );
 
   const runScan = useCallback(
-    async (clearCache: boolean) => {
+    async (clearCache: boolean, fullRescan = false) => {
       console.log("runScan", cluster);
       console.log("publicClient", publicClient);
       console.log("announcerAddress", announcerAddress);
@@ -269,7 +348,19 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
       if (cluster == null || !publicClient || !announcerAddress || !enabled) return;
 
 
-      const startBlock = getStartBlock(cluster);
+      let startBlock: bigint;
+      try {
+        startBlock = getStartBlock(cluster, fullRescan);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setProgress((p: ScanProgress) => ({
+          ...p,
+          phase: "error",
+          error: msg,
+          message: "Scanner configuration error",
+        }));
+        return;
+      }
       const subgraphUrl = getSubgraphUrl(cluster);
 
       if (clearCache) {
@@ -277,27 +368,49 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
         setAnnouncements([]);
       }
 
-      setProgress((p: ScanProgress) => ({ ...p, phase: "loading-cache", message: "Loading cache…", error: null }));
+      setProgress((p: ScanProgress) => ({
+        ...p,
+        phase: "loading-cache",
+        message: "Loading cache…",
+        error: null,
+        warning: null,
+        unsupportedEventVersionCount: 0,
+      }));
 
       const cached = await getAnnouncementsForCluster(cluster);
       const sync = await getSyncState(cluster);
       const lastScanned = sync?.lastScannedSlot ?? null;
-      // Gap detection: ensure cached announcements cover up to lastScannedSlot
-      if (cached.length > 0 && lastScanned != null) {
-        const maxCachedSlot = Math.max(...cached.map((a) => a.slot));
-        if (maxCachedSlot < lastScanned) {
-          console.warn('[useScanner] Detected gap between cached announcements and sync state. Resetting sync.', {
+      let repairedCache = cached;
+      if (!clearCache && lastScanned != null) {
+        const maxCachedSlot =
+          cached.length > 0 ? Math.max(...cached.map((a) => a.slot)) : null;
+        if (maxCachedSlot == null || maxCachedSlot < lastScanned) {
+          const repairFrom = BigInt(
+            Math.max((maxCachedSlot ?? Number(startBlock) - 1) + 1, Number(startBlock)),
+          );
+          const repairTo = BigInt(lastScanned);
+          if (repairFrom > repairTo) {
+            repairedCache = cached;
+          } else {
+          console.warn('[useScanner] Detected ledger gap between cached announcements and sync state. Backfilling missing range.', {
             maxCachedSlot,
             lastScanned,
+            repairFrom: String(repairFrom),
+            repairTo: String(repairTo),
           });
-          await clearSyncState(cluster);
-          // Inform UI that a gap was detected and a full sync may be needed
-          setProgress((p) => ({
+          setProgress((p: ScanProgress) => ({
             ...p,
-            phase: "error",
-            error: "Ledger gap detected – cache cleared. Click \"Full Rescan\" to re-sync.",
-            message: "Ledger gap detected",
+            phase: "backfilling",
+            percent: 0,
+            message: "Repairing ledger gap… 0%",
+            fromBlock: repairFrom,
+            toBlock: repairTo,
+            currentBlock: repairFrom,
+            error: null,
           }));
+          await runChunkedRpcSync(publicClient, announcerAddress, repairFrom, repairTo, true, repairFrom, "backfilling", "Repairing ledger gap");
+          repairedCache = await getAnnouncementsForCluster(cluster);
+          }
         }
       }
       const toBlock = BigInt(await publicClient.getSlot());
@@ -305,7 +418,7 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
         clearCache || lastScanned == null
           ? startBlock
           : BigInt(Math.max(lastScanned + 1, Number(startBlock)));
-      const cacheEmpty = cached.length === 0 && lastScanned == null;
+      const cacheEmpty = repairedCache.length === 0 && lastScanned == null;
 
       if (subgraphUrl) {
         setProgress((p) => ({
@@ -359,7 +472,7 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
           error: null,
         }));
       } else {
-        setAnnouncements(cached);
+        setAnnouncements(repairedCache);
         if (fromBlock > toBlock) {
           setProgress((p: ScanProgress) => ({
             ...p,
@@ -440,7 +553,13 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
 
       const sync = await getSyncState(cluster);
       const toBlock = BigInt(await publicClient.getSlot());
-      const startBlock = getStartBlock(cluster);
+      let startBlock: bigint;
+      try {
+        startBlock = getStartBlock(cluster);
+      } catch {
+        await runScan(false);
+        return;
+      }
       const lastScanned = sync?.lastScannedSlot ?? null;
       const fromBlock =
         lastScanned == null ? startBlock : BigInt(Math.max(lastScanned + 1, Number(startBlock)));
@@ -466,7 +585,7 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
   const retrySync = useCallback(async () => {
     if (cluster == null) return;
     refreshKeyRef.current += 1;
-    await runScan(true);
+    await runScan(true, true);
   }, [cluster, runScan]);
 
   const refresh = useCallback(async () => {
@@ -519,19 +638,25 @@ export function useScanner(opts: UseScannerOptions): UseScannerResult {
           const results = await Promise.all(
             addressesToPoll.map(async (addr) => {
               try {
-                return await publicClient.getBalance(addr);
+                const [native, tokens] = await Promise.all([
+                  publicClient.getBalance(addr),
+                  publicClient.getTokenBalances?.(addr) ?? Promise.resolve({}),
+                ]);
+                return { native, tokens };
               } catch {
-                return 0n;
+                return { native: 0n, tokens: {} };
               }
             })
           );
           if (cancelled) return;
           const next: Record<string, bigint> = {};
+          const nextTokens: Record<string, Record<string, bigint>> = {};
           addressesToPoll.forEach((addr, i) => {
-            next[addr] = results[i] ?? 0n;
+            next[addr] = results[i]?.native ?? 0n;
+            nextTokens[addr] = results[i]?.tokens ?? {};
           });
           setGhostBalances(next);
-          setGhostTokenBalances({});
+          setGhostTokenBalances(nextTokens);
         }
       } catch {
         if (!cancelled) {

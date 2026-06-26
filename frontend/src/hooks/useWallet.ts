@@ -2,6 +2,9 @@ import { useContext, useLayoutEffect, useMemo, useRef } from "react";
 import { StellarWalletContext } from "../context/StellarWalletProviders";
 import { getNetwork } from "../lib/chain";
 import { getHorizonServer } from "../lib/stellar";
+import {
+  horizonTrustlineBalancesToStroops,
+} from "../lib/stellarBalances";
 
 export function useWallet() {
   const ctx = useContext(StellarWalletContext);
@@ -50,6 +53,10 @@ export function useWallet() {
         return BigInt(
           Math.round(parseFloat((native as { balance: string })?.balance ?? "0") * 1e7),
         );
+      },
+      getTokenBalances: async (address: string) => {
+        const account = await getHorizonServer().loadAccount(address);
+        return horizonTrustlineBalancesToStroops(account.balances);
       },
       getSlot: async () => {
         const ledgers = await getHorizonServer().ledgers().order("desc").limit(1).call();

@@ -48,6 +48,7 @@ import { useToast } from "../context/ToastContext";
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { getNativeToken } from "../lib/tokens";
 import type { TokenInfo } from "../lib/tokens";
+import { formatStroopsToXlm } from "../lib/decimalParser";
 import { ExplorerLink } from "./ExplorerLink";
 import { PrivacyWarningCallout } from "./PrivacyWarningCallout";
 import { SCANNER_PRIVACY_WARNING } from "../lib/privacyThreatModel";
@@ -59,6 +60,7 @@ import { GhostAnnounceModal } from "./GhostAnnounceModal";
 import { ModalShell } from "./ModalShell";
 import { RecoveryDocLink } from "./RecoveryDocLink";
 import { getFeatureFlags } from "../lib/featureFlags";
+import { getDocUrl } from "../lib/docsLinks";
 
 export type FoundTx = {
   id: string;
@@ -330,6 +332,19 @@ function scanForAttestations(
 
 export type PortfolioEntry = { tx: FoundTx; balanceRaw: bigint };
 
+type AssetBalanceEntry = {
+  address: string;
+  assetKey: string;
+  code: string;
+  issuer: string;
+  balanceRaw: bigint;
+};
+
+function splitAssetKey(assetKey: string): { code: string; issuer: string } {
+  const [code = assetKey, issuer = ""] = assetKey.split(":");
+  return { code, issuer };
+}
+
 export function PrivateBalanceView() {
   const [found, setFound] = useState<FoundTx[]>([]);
   const [loading, setLoading] = useState(true);
@@ -418,6 +433,20 @@ export function PrivateBalanceView() {
     }
     return { asset: nativeAsset, totalRaw, entries };
   }, [found, ghostTxs, nativeAsset]);
+
+  const assetBalances = useMemo<AssetBalanceEntry[]>(() => {
+    const entries: AssetBalanceEntry[] = [];
+    for (const [address, balances] of Object.entries(scanner.ghostTokenBalances)) {
+      for (const [assetKey, balanceRaw] of Object.entries(balances)) {
+        if (balanceRaw <= 0n) continue;
+        const { code, issuer } = splitAssetKey(assetKey);
+        entries.push({ address, assetKey, code, issuer, balanceRaw });
+      }
+    }
+    return entries.sort((a, b) =>
+      a.code.localeCompare(b.code) || a.issuer.localeCompare(b.issuer),
+    );
+  }, [scanner.ghostTokenBalances]);
 
   const setDestination = useCallback((txId: string, value: string) => {
     setDestinationByTxId((prev) => ({ ...prev, [txId]: value }));
@@ -832,6 +861,19 @@ export function PrivateBalanceView() {
             >
               {refreshing ? "Refreshing…" : "Refresh"}
             </button>
+            <button
+              type="button"
+              onClick={handleRetrySync}
+              disabled={
+                refreshing ||
+                scanner.progress.phase === "syncing" ||
+                scanner.progress.phase === "backfilling" ||
+                scanner.progress.phase === "indexer-fetch"
+              }
+              className="rounded-xl border border-ink-600 bg-ink-950/30 px-3.5 py-2 text-sm font-medium text-mist transition-colors hover:border-white/30 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Full rescan
+            </button>
             {manualGhostEnabled && (
             <button
               type="button"
@@ -921,6 +963,24 @@ export function PrivateBalanceView() {
               </button>
             </div>
           )}
+          {scanner.progress.warning && (
+            <div className="mt-3 rounded-xl border border-warning/30 bg-warning/10 p-3">
+              <p className="text-warning text-xs font-mono">
+                {scanner.progress.warning} Skipped{" "}
+                {scanner.progress.unsupportedEventVersionCount.toLocaleString()}{" "}
+                event
+                {scanner.progress.unsupportedEventVersionCount === 1 ? "" : "s"}.{" "}
+                <a
+                  href={getDocUrl("wasm-scanner-upgrade")}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline underline-offset-2"
+                >
+                  Update WASM scanner
+                </a>
+              </p>
+            </div>
+          )}
         </div>
       </div>
 
@@ -938,7 +998,7 @@ export function PrivateBalanceView() {
         <div className="rounded-2xl border border-ink-700 bg-ink-900/25 p-6">
           <p className="text-mist text-sm">Deciphering payments…</p>
         </div>
-      ) : totalSol === 0n && allEntries.length === 0 ? (
+      ) : totalSol === 0n && allEntries.length === 0 && assetBalances.length === 0 ? (
         <div className="rounded-2xl border border-ink-700 bg-ink-900/25 p-6">
           <p className="text-mist text-sm">No incoming payments found yet.</p>
           <p className="text-mist/70 text-xs mt-1">
@@ -958,12 +1018,54 @@ export function PrivateBalanceView() {
             </p>
           </div>
 
+          {assetBalances.length > 0 && (
+            <>
+              <h3 className="font-display text-xl font-bold text-white">
+                Other assets
+              </h3>
+              <div className="space-y-3">
+                {assetBalances.map((entry) => (
+                  <div
+                    key={`${entry.address}-${entry.assetKey}`}
+                    className="rounded-2xl border border-ink-700 bg-ink-900/25 p-5"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-ink-800 text-mist border border-ink-600">
+                            {entry.code}
+                          </span>
+                          <ExplorerLink
+                            cluster={cluster}
+                            value={entry.address}
+                            type="address"
+                            className="text-mist text-xs"
+                          />
+                        </div>
+                        <p className="text-success font-semibold mt-0.5">
+                          {formatStroopsToXlm(entry.balanceRaw)} {entry.code}
+                        </p>
+                        {entry.issuer && (
+                          <p className="text-mist/70 text-xs mt-1 break-all">
+                            Issuer {entry.issuer}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
           {/* List of stealth addresses */}
-          <h3 className="font-display text-xl font-bold text-white">
-            XLM — Stealth addresses
-          </h3>
-          <div className="space-y-3">
-            {allEntries
+          {allEntries.length > 0 && (
+            <>
+              <h3 className="font-display text-xl font-bold text-white">
+                XLM — Stealth addresses
+              </h3>
+              <div className="space-y-3">
+                {allEntries
               .filter((e) => e.balanceRaw > 0n)
               .map(({ tx, balanceRaw }) => {
                 const amountStr = formatXlm(balanceRaw);
@@ -1143,7 +1245,9 @@ export function PrivateBalanceView() {
                   </div>
                 );
               }) ?? null}
-          </div>
+              </div>
+            </>
+          )}
         </div>
       )}
 
